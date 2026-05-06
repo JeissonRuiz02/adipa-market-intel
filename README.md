@@ -414,4 +414,4 @@ The heavy pipeline runs on a 24-hour shell loop (`entrypoint.sh`) that calls `sc
 
 ---
 
-*Developed as a technical assessment for ADIPA · 2024*
+*Developed as a technical assessment for ADIPA · 2026
