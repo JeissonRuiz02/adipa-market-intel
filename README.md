@@ -35,7 +35,7 @@ This system automates that market intelligence continuously.
 
 Two pipelines with distinct responsibilities running on Docker:
 
-**Light pipeline** (`scrape_prices`) — runs every 15 minutes via Prefect. Checks prices of known courses from Platzi, Coursera, and Udemy via plain HTTP and UPSERTs the results into `raw_courses`. Takes seconds. Low resource usage.
+**Light pipeline** (`scrape_prices`) — runs every 15 minutes via Prefect. Checks prices of known courses from Platzi, Coursera, Udemy and Domestika via plain HTTP and UPSERTs the results into `raw_courses`. Takes seconds. Low resource usage.
 
 **Heavy pipeline** (`scraper.py` + `analyze.py`) — runs once per day on a 24-hour shell loop inside `worker-heavy`. Scrapes the full catalog using Playwright (JS-rendered pages), then normalizes prices to USD with Polars and writes daily statistics to `market_report`. Takes minutes.
 
@@ -71,13 +71,10 @@ The heavy pipeline consumes what the light pipeline accumulates — they complem
 **Data flow:**
 
 ```
-Platzi ───┐
-           │──► scraper.py ──► raw_courses ──► analyze.py ──► market_report
-Coursera ──┤    (Playwright      (Postgres)     (Polars          (Postgres)
-           │     daily)                          daily)
-Udemy ─────┤
-           │
-Domestika ─┘
+Platzi ────┐
+Coursera ──┤──► scraper.py ──► raw_courses ──► analyze.py ──► market_report
+Udemy ─────┤    (Playwright      (Postgres)     (Polars          (Postgres)
+Domestika ─┘     daily)                          daily)
 
 Platzi ────┐
 Coursera ──┤──► scrape_prices ──► raw_courses
@@ -92,6 +89,17 @@ Udemy ─────┘    (HTTP, every
 | `worker-light` | Prefect schedule (every 15 min) | Prefect — `light-pool` |
 | `worker-heavy` | `entrypoint.sh` shell loop | None — runs `scraper.py` then `analyze.py` directly every 24h |
 | `flow-deployer` | `docker compose up` (once) | Registers `scrape-prices-scheduled` in Prefect, then exits |
+
+### Scraping status per source
+
+| Source | Method | Result |
+|---|---|---|
+| Coursera | Playwright + JSON-LD | Real data — titles, URLs, instructors |
+| Platzi | Playwright + link extraction | Partial — 1 real course + fallback |
+| Udemy | Playwright (captcha blocks) | Fallback — known courses with approximate data |
+| Domestika | Playwright + CSS selectors | Fallback — known courses with approximate data |
+
+Udemy and Domestika detect headless browsers and return captchas. The fallback contains real course titles and approximate prices documented in `workers/heavy/scraper.py`. In a second iteration this would be solved with authenticated sessions or rotating proxies.
 
 ### Postgres tables
 
@@ -122,6 +130,12 @@ Polars has concrete technical advantages for this use case:
 - **Lazy API:** transformations are planned and optimized before execution. For datasets that grow over time, this makes a real difference.
 - **Lower memory footprint:** Polars uses Apache Arrow internally. For the heavy pipeline running in a container limited to 1 GB, this matters.
 - **Explicit expressions:** transformation code is more readable and less error-prone than Pandas indexing.
+
+### Why the heavy pipeline doesn't use Prefect as scheduler
+
+`prefect==2.19.9` conflicts with the version of pydantic installed in the same image (`TypeError: 'type' object is not iterable`). Rather than downgrade pydantic and risk breaking Polars or connectorx, the heavy worker runs on a 24-hour shell loop via `entrypoint.sh` — fully autonomous, no Prefect dependency.
+
+This reinforces isolation: the heavy container has zero overlap with the orchestrator. `flows/analyze_market.py` exists as a Prefect-wrapped version of the same logic for on-demand manual runs. Migrating to Prefect 3.x (which resolves the pydantic conflict natively) is the clean fix for a second iteration.
 
 ### Why connectorx for reading Postgres?
 
@@ -246,8 +260,6 @@ docker exec adipa_worker_light python /app/flows/scrape_prices.py
 
 ### Run the heavy pipeline manually
 
-The heavy worker runs `scraper.py` then `analyze.py` in sequence. You can trigger each directly:
-
 ```bash
 # Full Playwright scrape (writes to raw_courses)
 docker exec adipa_worker_heavy python /app/workers/heavy/scraper.py
@@ -279,6 +291,10 @@ docker exec -it adipa_postgres psql -U adipa -d market_intel \
 docker exec adipa_worker_light pip show polars
 # Expected: WARNING: Package(s) not found: polars
 
+# Playwright must NOT exist in the light worker
+docker exec adipa_worker_light pip show playwright
+# Expected: WARNING: Package(s) not found: playwright
+
 # Polars must exist in the heavy worker
 docker exec adipa_worker_heavy pip show polars
 # Expected: Name: polars / Version: 0.20.31
@@ -287,9 +303,9 @@ docker exec adipa_worker_heavy pip show polars
 ### Verify idempotency
 
 ```bash
-# Run the light pipeline twice in a row
-docker exec adipa_worker_light python /app/flows/scrape_prices.py
-docker exec adipa_worker_light python /app/flows/scrape_prices.py
+# Run the scraper twice in a row
+docker exec adipa_worker_heavy python /app/workers/heavy/scraper.py
+docker exec adipa_worker_heavy python /app/workers/heavy/scraper.py
 
 # Row count must not increase — UPSERT, not INSERT
 docker exec -it adipa_postgres psql -U adipa -d market_intel \
@@ -300,17 +316,15 @@ docker exec -it adipa_postgres psql -U adipa -d market_intel \
 
 ## VM deployment
 
-### Recommended provider: Oracle Cloud Free Tier
+The system is deployed on a GCP e2-medium instance (2 vCPU, 4 GB RAM).
 
-Oracle Cloud offers 2 VMs with 4 vCPU ARM + 24 GB RAM **free forever** (not a 12-month trial). It's the most generous free tier available for this type of project.
-
-**Quick alternative:** DigitalOcean basic Droplet ($6/month), simpler to configure in 10 minutes if you already have an account.
+Prefect UI: `http://34.71.29.154:4200`
 
 ### Setup on the VM
 
 ```bash
 # 1. Connect to the VM
-ssh ubuntu@YOUR_PUBLIC_IP
+ssh user@YOUR_PUBLIC_IP
 
 # 2. Install Docker
 curl -fsSL https://get.docker.com | sh
@@ -321,26 +335,19 @@ newgrp docker
 git clone https://github.com/tu-usuario/adipa-market-intel.git
 cd adipa-market-intel
 
-# 4. Configure environment (set PUBLIC_HOST to the server's public IP)
+# 4. Configure environment
 cp .env.example .env
 nano .env
 # → PUBLIC_HOST=YOUR_PUBLIC_IP
 
 # 5. Open port 4200 in the VM firewall
-# Oracle Cloud: VCN → Security Lists → Ingress Rules → TCP 4200
-# DigitalOcean: firewall is off by default
+# GCP: VPC Network → Firewall → Create rule → TCP 4200
 
 # 6. Start
 docker compose up --build -d
 
-# 7. Verify it's running
+# 7. Verify
 docker compose ps
-```
-
-### Access the Prefect UI on the VM
-
-```
-http://YOUR_PUBLIC_IP:4200
 ```
 
 ---
@@ -367,7 +374,7 @@ Idempotency is guaranteed by Postgres unique constraints, not by application log
 | `@task run-polars-analysis` (manual) | `retries=2, retry_delay_seconds=60` |
 | `entrypoint.sh` (heavy, scheduled) | Shell `||` continues to next step on failure |
 
-**Per-source resilience:** in the light pipeline, a single source failure doesn't stop the others — all sources are checked in the same task but each failure is caught and logged independently. In the heavy scraper, each source runs in its own try/except block; a Playwright failure on one source doesn't abort the remaining ones.
+**Per-source resilience:** each source runs in its own try/except block in the heavy scraper. A Playwright failure or captcha on one source doesn't abort the remaining ones — it logs the error and falls back to known course data.
 
 **Audit always:** `scrape_log` is written in a `finally` block (light pipeline) or after each source attempt (heavy scraper), covering both success and failure cases.
 
@@ -387,9 +394,12 @@ The heavy worker uses a **completely separate Docker image** with no Prefect dep
 ```bash
 docker exec adipa_worker_light pip show polars
 # WARNING: Package(s) not found: polars  ✓
+
+docker exec adipa_worker_light pip show playwright
+# WARNING: Package(s) not found: playwright  ✓
 ```
 
-The heavy pipeline runs on a 24-hour shell loop (`entrypoint.sh`) that calls `scraper.py` and `analyze.py` directly — no Prefect involvement. `flows/analyze_market.py` is a Prefect-wrapped version of the same logic available for on-demand manual runs with a full audit trail in the Prefect UI.
+The heavy pipeline runs on a 24-hour shell loop (`entrypoint.sh`) that calls `scraper.py` and `analyze.py` directly — no Prefect involvement. This was a deliberate decision: `prefect==2.19.9` conflicts with pydantic v2 in the same image. Keeping Prefect out of the heavy container eliminates the conflict and reinforces isolation.
 
 ---
 
@@ -399,13 +409,13 @@ The heavy pipeline runs on a 24-hour shell loop (`entrypoint.sh`) that calls `sc
 - Integrate a live FX API (Fixer.io) instead of fixed rates
 - Add more sources: MasterClass, LinkedIn Learning, other Spanish-language platforms
 - Send the daily report to Slack with a week-over-week comparison
-- Schedule `analyze_market` as a Prefect deployment on a Prefect-aware heavy worker
+- Migrate to Prefect 3.x to resolve the pydantic conflict and schedule the heavy pipeline as a proper Prefect deployment
+- Use authenticated Playwright sessions or rotating proxies to bypass Udemy and Domestika captchas
 
 **Operations:**
 - Nginx reverse proxy with basic auth in front of the Prefect UI
 - Prefect alerts to Slack when a flow fails
 - Environment variables for FX rates (remove hardcoding)
-- Prefect metrics exported to Grafana
 
 **Quality:**
 - Unit tests for parsing and normalization functions
@@ -414,4 +424,4 @@ The heavy pipeline runs on a 24-hour shell loop (`entrypoint.sh`) that calls `sc
 
 ---
 
-*Developed as a technical assessment for ADIPA · 2026
+*Developed as a technical assessment for ADIPA · 2026*
