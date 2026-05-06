@@ -1,0 +1,9 @@
+# ── adipa-market-intel · worker light ────────
+# Solo librerías de scraping liviano.
+# Polars y libs pesadas viven en worker-heavy.
+
+httpx==0.27.0
+beautifulsoup4==4.12.3
+lxml==5.2.2
+psycopg2-binary==2.9.9
+tenacity==8.3.0
