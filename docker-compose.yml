@@ -1,0 +1,119 @@
+# adipa-market-intel
+# Orchestrator : Prefect 2
+# Database     : Postgres 16
+# Workers      : light (httpx) | heavy (Playwright + Polars) — fully isolated images
+
+x-prefect-env: &prefect-env
+  PREFECT_API_URL: http://prefect-server:4200/api
+  PREFECT_API_DATABASE_CONNECTION_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+
+services:
+
+  # ── 1. Postgres ───────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: adipa_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB:       ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── 2. Prefect Server ─────────────────────────
+  prefect-server:
+    image: prefecthq/prefect:2-python3.11
+    container_name: adipa_prefect_server
+    restart: unless-stopped
+    command: prefect server start --host 0.0.0.0
+    environment:
+      <<: *prefect-env
+      PREFECT_SERVER_API_HOST: 0.0.0.0
+      PREFECT_UI_API_URL: http://${PUBLIC_HOST:-localhost}:4200/api
+    ports:
+      - "4200:4200"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4200/api/health')"]
+      interval: 15s
+      timeout: 10s
+      retries: 6
+      start_period: 30s
+
+  # ── 3. Light worker ───────────────────────────
+  #    Runs scrape_prices flow every 15 minutes via Prefect (light-pool)
+  worker-light:
+    build:
+      context: ./workers/light
+      dockerfile: Dockerfile
+    container_name: adipa_worker_light
+    restart: unless-stopped
+    command: prefect worker start --pool light-pool
+    environment:
+      <<: *prefect-env
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    volumes:
+      - ./flows:/app/flows:ro
+      - ./workers:/app/workers:ro
+    depends_on:
+      prefect-server:
+        condition: service_healthy
+
+  # ── 4. Heavy worker ───────────────────────────
+  #    Isolated image — Playwright + Polars, no Prefect dependency
+  #    Runs scraper.py → analyze.py on a 24-hour shell loop (entrypoint.sh)
+  worker-heavy:
+    build:
+      context: ./workers/heavy
+      dockerfile: Dockerfile
+    container_name: adipa_worker_heavy
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    volumes:
+      - ./flows:/app/flows:ro
+      - ./workers:/app/workers:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  # ── 5. Flow deployer ──────────────────────────
+  #    Registers the scrape_prices schedule in Prefect, then exits
+  flow-deployer:
+    build:
+      context: ./workers/light
+      dockerfile: Dockerfile
+    container_name: adipa_flow_deployer
+    restart: "no"
+    command: python /app/flows/deploy.py
+    environment:
+      <<: *prefect-env
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    volumes:
+      - ./flows:/app/flows:ro
+      - ./workers:/app/workers:ro
+    depends_on:
+      prefect-server:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+
+networks:
+  default:
+    name: adipa_network
